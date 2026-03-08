@@ -1,0 +1,61 @@
+version: 3
+engine:
+  asr_backend: faster-whisper
+  model_profile: base
+  compute_type: int8
+  language: en
+  network_fallback_enabled: false
+  cloud_model: gpt-4o-mini-transcribe
+  cloud_api_base: null
+  cloud_timeout_seconds: 30
+audio:
+  sample_rate_hz: 16000
+  channels: 1
+  chunk_ms: 160
+  device_id: null
+vad:
+  enabled: true
+  speech_threshold: 0.5
+  min_speech_ms: 120
+wake_word:
+  enabled: true
+  phrase: voice key
+  sensitivity: 0.55
+  wake_window_timeout_seconds: 5
+modes:
+  default: wake_word
+  inactivity_auto_pause_seconds: 30
+  allow_continuous_mode: true
+  paused_resume_phrase_enabled: true
+hotkeys:
+  toggle_listening: ctrl+shift+`
+  pause: ctrl+shift+p
+  stop: ctrl+shift+e
+typing:
+  char_delay_ms: 8
+  undo_buffer_segments: 30
+  confidence_threshold: 0.5
+ui:
+  tray_enabled: true
+  start_minimized_to_tray: true
+  terminal_dashboard: true
+  audio_feedback: true
+  show_latency: true
+system:
+  autostart_enabled: false
+  single_instance: true
+  daemon_mode_default: true
+features:
+  text_expansion_enabled: false
+  per_app_profiles_enabled: false
+  window_commands_enabled: false
+privacy:
+  telemetry_enabled: false
+  transcript_logging: false
+  redact_debug_text: true
+  persist_audio: false
+app_profiles: {}
+custom_commands: {}
+snippets:
+  ty: thank you
+  brb: be right back

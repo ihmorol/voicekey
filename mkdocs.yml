@@ -106,7 +106,7 @@ nav:
 extra:
   social:
     - icon: fontawesome/brands/github
-      link: https://github.com/voicekey/voice-key
+      link: https://github.com/ihmorol/voice-key
     - icon: fontawesome/brands/python
       link: https://pypi.org/project/voicekey/
 
