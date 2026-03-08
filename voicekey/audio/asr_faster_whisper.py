@@ -18,7 +18,7 @@ import logging
 import sys
 import threading
 from dataclasses import dataclass
-from queue import Queue
+from queue import Empty, Queue
 from typing import AsyncGenerator, Dict, List, Optional
 
 import numpy as np
@@ -165,10 +165,6 @@ class ASREngine:
         >>> events = engine.transcribe(audio_samples)
         >>> for event in events:
         ...     print(f"{'[FINAL]' if event.is_final else '[PARTIAL]'} {event.text}")
-
-        >>> # Streaming transcription
-        >>> async for event in engine.stream_transcribe(audio_queue):
-        ...     print(event.text)
     """
 
     SUPPORTED_SAMPLE_RATES = [8000, 16000, 22050, 32000, 44100, 48000]
@@ -410,24 +406,9 @@ class ASREngine:
         if self._model is None:
             raise TranscriptionError("Model not loaded")
 
-        # Ensure audio is float32 numpy array
-        if not isinstance(audio, np.ndarray):
-            audio = np.array(audio, dtype=np.float32)
-
-        # Handle empty audio
+        audio = self._prepare_audio(audio)
         if len(audio) == 0:
             return []
-
-        # Convert stereo to mono if needed
-        if audio.ndim > 1:
-            audio = audio.mean(axis=1)
-
-        # Resample to 16kHz if needed (faster-whisper expects 16kHz)
-        target_sample_rate = 16000
-        if self._sample_rate != target_sample_rate:
-            original_length = len(audio)
-            target_length = int(original_length * target_sample_rate / self._sample_rate)
-            audio = scipy_signal.resample_poly(audio, target_length, original_length).astype(np.float32)
 
         # If timeout is disabled (0), run directly
         if self._transcription_timeout <= 0:
@@ -476,13 +457,6 @@ class ASREngine:
         Raises:
             TranscriptionError: If transcription fails
         """
-        # Resample to 16kHz if needed (faster-whisper expects 16kHz)
-        target_sample_rate = 16000
-        if self._sample_rate != target_sample_rate:
-            original_length = len(audio)
-            target_length = int(original_length * target_sample_rate / self._sample_rate)
-            audio = scipy_signal.resample_poly(audio, target_length, original_length).astype(np.float32)
-
         try:
             # Run transcription
             segments, info = self._model.transcribe(
@@ -557,17 +531,38 @@ class ASREngine:
             logger.error(f"Transcription error: {e}")
             raise TranscriptionError(f"Transcription failed: {e}")
 
+    def _prepare_audio(self, audio: np.ndarray) -> np.ndarray:
+        """Normalize and resample audio to match Faster-Whisper input expectations."""
+        if not isinstance(audio, np.ndarray):
+            audio = np.array(audio, dtype=np.float32)
+        elif audio.dtype != np.float32:
+            audio = audio.astype(np.float32, copy=False)
+
+        if len(audio) == 0:
+            return np.array([], dtype=np.float32)
+
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+
+        target_sample_rate = 16000
+        if self._sample_rate != target_sample_rate:
+            original_length = len(audio)
+            target_length = int(original_length * target_sample_rate / self._sample_rate)
+            audio = scipy_signal.resample_poly(audio, target_length, original_length).astype(np.float32)
+
+        return audio
+
     async def stream_transcribe(
         self, audio_queue: Queue, chunk_duration: float = 1.0
     ) -> AsyncGenerator[TranscriptEvent, None]:
-        """Stream transcription from an audio queue.
+        """Compatibility streaming wrapper for queued chunk transcription.
 
-        This method processes audio chunks from a queue as they become
-        available, yielding transcript events in real-time.
+        This interface is currently unused by runtime code paths but is retained
+        to avoid breaking external callers that may still use it.
 
         Args:
             audio_queue: Queue containing audio chunks (numpy arrays)
-            chunk_duration: Expected duration of each chunk in seconds
+            chunk_duration: Deprecated and ignored; retained for API compatibility
 
         Yields:
             TranscriptEvent objects as audio is processed
@@ -575,135 +570,24 @@ class ASREngine:
         Raises:
             TranscriptionError: If streaming transcription fails
         """
-        # Ensure model is loaded
-        if not self._model_loaded:
-            self.load_model()
-
-        if self._model is None:
-            raise TranscriptionError("Model not loaded")
-
-        # Accumulate audio for streaming
-        accumulated_audio: List[np.ndarray] = []
-        accumulated_samples = 0
-        target_samples = int(self._sample_rate * chunk_duration)
-
         while True:
             try:
-                # Get audio chunk from queue with timeout
                 audio_chunk = audio_queue.get(timeout=1.0)
-
-                # Check for sentinel value (None) to signal end
-                if audio_chunk is None:
-                    # Process remaining accumulated audio
-                    if accumulated_audio:
-                        audio = np.concatenate(accumulated_audio)
-                        events = self._transcribe_sync(audio)
-                        for event in events:
-                            yield event
-                    break
-
-                # Add chunk to accumulator
-                if not isinstance(audio_chunk, np.ndarray):
-                    audio_chunk = np.array(audio_chunk, dtype=np.float32)
-
-                accumulated_audio.append(audio_chunk)
-                accumulated_samples += len(audio_chunk)
-
-                # Process when we have enough samples
-                if accumulated_samples >= target_samples:
-                    audio = np.concatenate(accumulated_audio)
-
-                    # Transcribe this chunk
-                    events = self._transcribe_sync(audio)
-
-                    for event in events:
-                        yield event
-
-                    # Keep a small overlap for continuity
-                    overlap_samples = int(self._sample_rate * 0.1)  # 100ms overlap
-                    if accumulated_samples > overlap_samples:
-                        # Keep last portion for continuity
-                        kept_samples = accumulated_samples - target_samples + overlap_samples
-                        if kept_samples > 0:
-                            kept_audio = audio[-kept_samples:]
-                            accumulated_audio = [kept_audio]
-                            accumulated_samples = kept_samples
-                        else:
-                            accumulated_audio = []
-                            accumulated_samples = 0
-                    else:
-                        accumulated_audio = []
-                        accumulated_samples = 0
-
+            except Empty:
+                continue
             except Exception as e:
                 logger.error(f"Stream transcription error: {e}")
                 raise TranscriptionError(f"Streaming transcription failed: {e}")
 
-    def _transcribe_sync(self, audio: np.ndarray) -> List[TranscriptEvent]:
-        """Synchronous transcription helper.
+            try:
+                if audio_chunk is None:
+                    break
 
-        Args:
-            audio: Audio samples as float32 numpy array
-
-        Returns:
-            List of TranscriptEvent objects
-        """
-        try:
-            segments, info = self._model.transcribe(
-                audio,
-                beam_size=5,
-                vad_filter=False,
-                vad_parameters=dict(min_silence_duration_ms=500),
-            )
-
-            events: List[TranscriptEvent] = []
-            language = info.language if hasattr(info, "language") else None
-            language_probability = (
-                info.language_probability if hasattr(info, "language_probability") else 1.0
-            )
-
-            for segment in segments:
-                text = segment.text.strip()
-                if not text:
-                    continue
-
-                confidence = segment.avg_log_prob if hasattr(segment, "avg_log_prob") else 0.0
-                confidence = max(0.0, min(1.0, (confidence + 2.0) / 4.0))
-
-                start = segment.start if hasattr(segment, "start") else None
-                end = segment.end if hasattr(segment, "end") else None
-
-                events.append(
-                    TranscriptEvent(
-                        text=text,
-                        is_final=True,
-                        confidence=confidence,
-                        language=language,
-                        timestamp_start=start,
-                        timestamp_end=end,
-                    )
-                )
-
-            # Add partial if we have final results
-            if events:
-                partial_text = " ".join(e.text for e in events)
-                events.insert(
-                    0,
-                    TranscriptEvent(
-                        text=partial_text,
-                        is_final=False,
-                        confidence=language_probability,
-                        language=language,
-                        timestamp_start=events[0].timestamp_start if events else None,
-                        timestamp_end=None,
-                    ),
-                )
-
-            return events
-
-        except Exception as e:
-            logger.error(f"Sync transcription error: {e}")
-            raise TranscriptionError(f"Transcription failed: {e}")
+                for event in self.transcribe(audio_chunk):
+                    yield event
+            except Exception as e:
+                logger.error(f"Stream transcription error: {e}")
+                raise TranscriptionError(f"Streaming transcription failed: {e}")
 
     def _get_device(self) -> str:
         """Determine the actual device to use.

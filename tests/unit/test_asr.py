@@ -270,6 +270,63 @@ class TestASREngine:
         assert len(result) > 0
         assert isinstance(result[0], TranscriptEvent)
 
+    def test_transcribe_resamples_audio_once_for_non_16khz_input(self):
+        """Test non-16kHz input audio is resampled exactly once."""
+        engine = ASREngine(sample_rate=8000, transcription_timeout=0)
+        engine.load_model()
+
+        mock_segment = MagicMock()
+        mock_segment.text = "Resample test"
+        mock_segment.avg_log_prob = 0.0
+        mock_segment.start = 0.0
+        mock_segment.end = 1.0
+
+        mock_info = MagicMock()
+        mock_info.language = "en"
+        mock_info.language_probability = 0.9
+        mock_whisper_model.transcribe.return_value = ([mock_segment], mock_info)
+
+        audio = np.random.randn(8000).astype(np.float32) * 0.1
+
+        with patch(
+            "voicekey.audio.asr_faster_whisper.scipy_signal.resample_poly",
+            side_effect=lambda data, up, down: np.zeros(
+                int(len(data) * up / down), dtype=np.float32
+            ),
+        ) as resample_mock:
+            result = engine.transcribe(audio)
+
+        assert len(result) == 2
+        assert resample_mock.call_count == 1
+
+    def test_transcribe_preserves_partial_final_output_contract(self):
+        """Test transcript output keeps partial-first, final-segment contract."""
+        engine = ASREngine(transcription_timeout=0)
+        engine.load_model()
+
+        mock_segment = MagicMock()
+        mock_segment.text = "Hello world"
+        mock_segment.avg_log_prob = 0.5
+        mock_segment.start = 0.0
+        mock_segment.end = 1.0
+
+        mock_info = MagicMock()
+        mock_info.language = "en"
+        mock_info.language_probability = 0.95
+        mock_whisper_model.transcribe.return_value = ([mock_segment], mock_info)
+
+        audio = np.random.randn(16000).astype(np.float32) * 0.1
+        result = engine.transcribe(audio)
+
+        assert len(result) == 2
+        assert result[0].is_final is False
+        assert result[0].text == "Hello world"
+        assert result[0].language == "en"
+        assert result[1].is_final is True
+        assert result[1].text == "Hello world"
+        assert result[1].language == "en"
+        assert result[1].confidence == pytest.approx(0.625)
+
     def test_transcribe_model_not_loaded(self):
         """Test transcribe loads model automatically if not loaded."""
         engine = ASREngine()
