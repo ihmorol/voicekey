@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import queue
-import pytest
 from typing import Any, cast
+
+import numpy as np
+import pytest
 
 from voicekey.actions.router import ActionRouter
 from voicekey.app.main import RuntimeCoordinator
@@ -16,6 +18,7 @@ from voicekey.app.state_machine import (
     ListeningMode,
     VoiceKeyStateMachine,
 )
+from voicekey.app.watchdog import InactivityWatchdog, WatchdogTimerConfig
 from voicekey.audio.asr_faster_whisper import TranscriptEvent
 from voicekey.audio.wake import WakeWindowController
 from voicekey.platform.hotkey_base import HotkeyRegistrationResult
@@ -65,6 +68,19 @@ class StubAudioCapture:
         return self._queue
 
 
+class DropAwareAudioCapture(StubAudioCapture):
+    def __init__(self) -> None:
+        super().__init__()
+        self.drop_callback: Any = None
+
+    def set_drop_callback(self, callback: Any) -> None:
+        self.drop_callback = callback
+
+    def emit_drop(self, dropped_frames: int) -> None:
+        if callable(self.drop_callback):
+            self.drop_callback(dropped_frames)
+
+
 class RecordingHotkeyBackend:
     def __init__(self) -> None:
         self.registered: list[str] = []
@@ -81,6 +97,18 @@ class RecordingHotkeyBackend:
 
     def shutdown(self) -> None:
         self.shutdown_calls += 1
+
+
+class StubASREngine:
+    def __init__(self, events: list[TranscriptEvent]) -> None:
+        self._events = events
+
+    @property
+    def is_model_loaded(self) -> bool:
+        return True
+
+    def transcribe(self, _audio: Any) -> list[TranscriptEvent]:
+        return self._events
 
 
 def test_wake_phrase_transitions_standby_to_listening_and_opens_window() -> None:
@@ -143,6 +171,10 @@ def test_wake_window_timeout_transitions_listening_to_standby() -> None:
         ),
         wake_window=WakeWindowController(timeout_seconds=5.0, time_provider=clock.now),
     )
+    coordinator._watchdog = InactivityWatchdog(
+        config=WatchdogTimerConfig(wake_window_timeout_seconds=5.0),
+        clock=clock.now,
+    )
 
     coordinator.on_transcript("voice key")
     clock.tick(5.01)
@@ -163,6 +195,10 @@ def test_activity_hooks_reset_wake_timeout() -> None:
             initial_state=AppState.STANDBY,
         ),
         wake_window=WakeWindowController(timeout_seconds=5.0, time_provider=clock.now),
+    )
+    coordinator._watchdog = InactivityWatchdog(
+        config=WatchdogTimerConfig(wake_window_timeout_seconds=5.0),
+        clock=clock.now,
     )
 
     coordinator.on_transcript("voice key")
@@ -188,6 +224,10 @@ def test_transcript_activity_resets_wake_timeout() -> None:
             initial_state=AppState.STANDBY,
         ),
         wake_window=WakeWindowController(timeout_seconds=5.0, time_provider=clock.now),
+    )
+    coordinator._watchdog = InactivityWatchdog(
+        config=WatchdogTimerConfig(wake_window_timeout_seconds=5.0),
+        clock=clock.now,
     )
 
     coordinator.on_transcript("voice key")
@@ -474,3 +514,81 @@ def test_start_registers_and_stop_unregisters_injected_hotkey_backend() -> None:
     assert hotkey_backend.registered == ["ctrl+shift+`"]
     assert hotkey_backend.unregistered == ["ctrl+shift+`"]
     assert hotkey_backend.shutdown_calls == 1
+
+
+def test_toggle_mode_listening_transcript_routes_text_to_keyboard() -> None:
+    keyboard = RecordingKeyboardBackend()
+    coordinator = RuntimeCoordinator(
+        state_machine=VoiceKeyStateMachine(
+            mode=ListeningMode.TOGGLE,
+            initial_state=AppState.LISTENING,
+        ),
+        keyboard_backend=cast(Any, keyboard),
+    )
+
+    update = coordinator.on_transcript("hello from toggle")
+
+    assert update.routed_text == "hello from toggle"
+    assert keyboard.texts == ["hello from toggle "]
+
+
+def test_toggle_hotkey_sleep_flushes_buffered_audio_before_standby() -> None:
+    keyboard = RecordingKeyboardBackend()
+    coordinator = RuntimeCoordinator(
+        state_machine=VoiceKeyStateMachine(
+            mode=ListeningMode.TOGGLE,
+            initial_state=AppState.LISTENING,
+        ),
+        keyboard_backend=cast(Any, keyboard),
+        asr_engine=StubASREngine(
+            [TranscriptEvent(text="flush me", is_final=True, confidence=0.9)]
+        ),
+        transcribe_batch_frames=5,
+    )
+    coordinator._audio_buffer = [np.ones(100, dtype=np.float32), np.ones(100, dtype=np.float32)]
+
+    coordinator._on_toggle_hotkey()
+
+    assert coordinator.state is AppState.STANDBY
+    assert keyboard.texts == ["flush me "]
+
+
+def test_toggle_mode_inactivity_timeout_transitions_to_paused() -> None:
+    clock = FakeClock()
+    coordinator = RuntimeCoordinator(
+        state_machine=VoiceKeyStateMachine(
+            mode=ListeningMode.TOGGLE,
+            initial_state=AppState.LISTENING,
+        ),
+    )
+    coordinator._watchdog = InactivityWatchdog(
+        config=WatchdogTimerConfig(inactivity_auto_pause_seconds=2.0),
+        clock=clock.now,
+    )
+
+    assert coordinator.poll().transition is None
+    clock.tick(2.1)
+    update = coordinator.poll()
+
+    assert update.transition is not None
+    assert update.transition.to_state is AppState.PAUSED
+    assert coordinator.state is AppState.PAUSED
+
+
+def test_start_installs_audio_drop_callback_and_updates_runtime_counter() -> None:
+    capture = DropAwareAudioCapture()
+    coordinator = RuntimeCoordinator(
+        state_machine=VoiceKeyStateMachine(
+            mode=ListeningMode.TOGGLE,
+            initial_state=AppState.INITIALIZING,
+        ),
+        audio_capture=capture,
+        vad_processor=object(),
+        asr_engine=object(),
+    )
+
+    coordinator.start()
+    capture.emit_drop(4)
+    coordinator.stop()
+
+    assert coordinator.dropped_audio_frames == 4

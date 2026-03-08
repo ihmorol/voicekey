@@ -19,6 +19,8 @@ import queue
 import pytest
 
 from voicekey.app.state_machine import AppState, AppEvent, ListeningMode, VoiceKeyStateMachine
+from voicekey.app.main import RuntimeCoordinator
+from voicekey.audio.capture import AudioFrame
 from voicekey.audio.asr_faster_whisper import TranscriptEvent
 from voicekey.audio.vad import VADResult
 from voicekey.commands.parser import CommandParser, ParseKind
@@ -480,6 +482,63 @@ class TestPipelineErrorHandling:
             recording_keyboard_backend.type_text(parse_result.literal_text)
 
         assert recording_keyboard_backend.typed_texts == []
+
+
+class TestRuntimeCoordinatorIntegration:
+    """Integration tests for coordinator-driven speech routing behavior."""
+
+    def test_toggle_mode_short_buffer_flushes_and_types_on_hotkey_sleep(
+        self,
+        recording_keyboard_backend: RecordingKeyboardBackend,
+        mock_asr_engine: MockASREngine,
+    ) -> None:
+        machine = VoiceKeyStateMachine(
+            mode=ListeningMode.TOGGLE,
+            initial_state=AppState.LISTENING,
+        )
+        mock_asr_engine.set_transcripts(
+            [create_transcript_event("integration flush check", is_final=True)]
+        )
+        coordinator = RuntimeCoordinator(
+            state_machine=machine,
+            keyboard_backend=recording_keyboard_backend,
+            asr_engine=mock_asr_engine,
+            transcribe_batch_frames=5,
+            transcribe_idle_flush_seconds=10.0,
+        )
+
+        for index in range(4):
+            coordinator._process_frame(
+                AudioFrame(
+                    audio=generate_speech_like_audio(0.1),
+                    sample_rate=16000,
+                    timestamp=float(index),
+                )
+            )
+
+        coordinator._on_toggle_hotkey()
+
+        assert machine.state is AppState.STANDBY
+        assert recording_keyboard_backend.typed_texts == ["integration flush check "]
+
+    def test_toggle_mode_recognizes_pause_phrase_without_wake_word(
+        self,
+        recording_keyboard_backend: RecordingKeyboardBackend,
+    ) -> None:
+        machine = VoiceKeyStateMachine(
+            mode=ListeningMode.TOGGLE,
+            initial_state=AppState.LISTENING,
+        )
+        coordinator = RuntimeCoordinator(
+            state_machine=machine,
+            keyboard_backend=recording_keyboard_backend,
+        )
+
+        update = coordinator.on_transcript("pause voice key")
+
+        assert update.transition is not None
+        assert update.transition.to_state is AppState.PAUSED
+        assert machine.state is AppState.PAUSED
 
     def test_whitespace_only_transcript_handling(
         self,
