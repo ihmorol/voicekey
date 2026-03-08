@@ -8,9 +8,9 @@ This matrix maps requirements to backlog and verification status, including pend
 
 | Requirement | Backlog Story Coverage | Verification Method |
 |-------------|------------------------|---------------------|
-| FR-A01 | E01-S01 | audio capture integration tests |
-| FR-A02 | E01-S02 | VAD unit + integration tests |
-| FR-A03 | E01-S03 | ASR adapter tests |
+| FR-A01 | E01-S01 | audio capture integration tests + dropped-frame notification coverage (`tests/unit/test_capture.py`) |
+| FR-A02 | E01-S02 | VAD unit + integration tests + Silero chunking/no-wrap regressions (`tests/unit/test_vad.py`) |
+| FR-A03 | E01-S03 | ASR adapter tests + single-resample regression coverage (`tests/unit/test_asr.py`) |
 | FR-A04 | E01-S03 | transcript event contract tests |
 | FR-A05 | E01-S04 | threshold behavior tests |
 | FR-A06 | E01-S03 | model profile switch tests |
@@ -25,10 +25,10 @@ This matrix maps requirements to backlog and verification status, including pend
 | FR-C04 | E02-S03 | fuzzy on/off guardrail tests |
 | FR-C05 | E02-S04, E03-S03 | special phrase control-plane tests |
 | FR-M01 | E03-S01 | mode default transition tests |
-| FR-M02 | E03-S01, E04-S02 | toggle hotkey backend + runtime coordinator hotkey transition tests |
+| FR-M02 | E03-S01, E04-S02 | toggle hotkey backend + runtime coordinator hotkey transition tests + Linux hotkey listener restart-cycle tests (`tests/unit/test_hotkey_linux_backend.py`) |
 | FR-M03 | E03-S01, E03-S02 | continuous-mode warning/behavior tests |
-| FR-M04 | E03-S02 | inactivity auto-pause tests |
-| FR-M05 | E03-S02 | timer default/config tests |
+| FR-M04 | E03-S02 | inactivity auto-pause tests + toggle-mode timeout transition coverage (`tests/unit/test_runtime_coordinator.py`) |
+| FR-M05 | E03-S02 | timer default/config tests + coordinator timer wiring from config (`tests/unit/test_cli.py`) |
 | FR-M06 | E03-S03 | paused output suppression tests |
 | FR-M07 | E03-S03 | paused resume phrase + hotkey resume channel tests |
 | FR-S01 | E05-S03, E10-S02 | tray-daemon startup tests + integration harness (`tests/integration/test_tray_integration.py`) |
@@ -89,7 +89,7 @@ This matrix maps requirements to backlog and verification status, including pend
 | Onboarding skip flow writes safe defaults | E06-S09 | skip-path config safety tests |
 | Performance targets (wake, ASR, parse, p50/p95) | E10-S03 | complete - `tests/perf/benchmark_runner.py` measures latency for wake detection (p50<1ms), command parsing (p50<1ms), ASR simulated (p50<1ms), state machine (p50<0.1ms); all pass p50<=200ms, p95<=350ms thresholds; 29 perf tests + 11 integration tests passing |
 | Resource budgets (CPU/memory/disk) | E10-S03 | complete - `tests/perf/resource_monitor.py` measures CPU/memory during idle/active states; validates idle CPU<=5%, active CPU<=35%, memory<=300MB budgets; resource budget tests passing |
-| Reliability bullets (single-instance, reconnect, crash-safe shutdown, bounded retries) | E03-S04, E03-S05, E10-S05 | complete - E03-S04 resilience tests (`tests/unit/test_runtime_resilience.py`); E03-S05 single-instance/shutdown tests (`tests/unit/test_single_instance.py`, `tests/unit/test_shutdown.py`); E10-S05 reliability/soak tests (`tests/integration/test_reliability.py`, `tests/perf/test_soak.py`, 44 tests covering reconnect, rapid toggles, paused-resume race conditions, state machine stress, memory leak detection, long-duration operation simulation) |
+| Reliability bullets (single-instance, reconnect, crash-safe shutdown, bounded retries) | E03-S04, E03-S05, E10-S05 | complete - E03-S04 resilience tests (`tests/unit/test_runtime_resilience.py`); E03-S05 single-instance/shutdown tests (`tests/unit/test_single_instance.py`, `tests/unit/test_shutdown.py`) plus status lock-probing regressions (`tests/unit/test_cli.py`); E10-S05 reliability/soak tests (`tests/integration/test_reliability.py`, `tests/perf/test_soak.py`, 44 tests covering reconnect, rapid toggles, paused-resume race conditions, state machine stress, memory leak detection, long-duration operation simulation) |
 | Privacy bullets (local-default runtime, opt-in hybrid cloud fallback, no telemetry, no raw audio persistence, no transcript logs by default) | E09-S01, E09-S02, E09-S03, E01-S05 | complete for privacy defaults and hybrid controls: cloud mode remains explicit opt-in, cloud-primary fails closed without credentials, and hybrid mode downgrades safely to local-only with warning |
 | Incident response flow (redacted diagnostics, pause/disable autostart) | E09-S02 | `docs/incident-response.md` + diagnostics security tests |
 | Usability targets (first setup <=5 min, first sentence <=2 min) | E06-S03, E10-S02 | complete - onboarding timing evidence exists; integration harness tests validate end-to-end pipeline flow (`tests/integration/test_pipeline_integration.py`) |
