@@ -15,6 +15,7 @@ from typing import Any
 import click
 import yaml
 
+from voicekey.app.routing_policy import RuntimeRoutingPolicy
 from voicekey.app.main import RuntimeCoordinator
 from voicekey.app.state_machine import AppEvent, AppState, ListeningMode, VoiceKeyStateMachine
 from voicekey.config.manager import (
@@ -173,6 +174,18 @@ def _create_runtime_coordinator(
 
     vad_threshold = getattr(getattr(config, "vad", None), "speech_threshold", 0.5)
     sample_rate = getattr(getattr(config, "audio", None), "sample_rate_hz", 16000)
+    chunk_ms = getattr(getattr(config, "audio", None), "chunk_ms", 100)
+    chunk_duration_seconds = max(0.08, float(chunk_ms) / 1000.0)
+    transcribe_batch_frames = max(3, int(round(0.5 / chunk_duration_seconds)))
+    wake_window_timeout_seconds = float(
+        getattr(getattr(config, "wake_word", None), "wake_window_timeout_seconds", 5)
+    )
+    inactivity_auto_pause_seconds = float(
+        getattr(getattr(config, "modes", None), "inactivity_auto_pause_seconds", 30)
+    )
+    paused_resume_phrase_enabled = bool(
+        getattr(getattr(config, "modes", None), "paused_resume_phrase_enabled", True)
+    )
     toggle_hotkey = getattr(
         getattr(config, "hotkeys", None),
         "toggle_listening",
@@ -188,10 +201,16 @@ def _create_runtime_coordinator(
     # Create coordinator - sample rate will be auto-detected by AudioCapture if backend overrides it.
     coordinator = RuntimeCoordinator(
         state_machine=state_machine,
+        routing_policy=RuntimeRoutingPolicy(paused_resume_phrase_enabled=paused_resume_phrase_enabled),
         keyboard_backend=keyboard_backend,
         device_index=device_index,
         sample_rate=sample_rate,
         vad_threshold=vad_threshold,
+        wake_window_timeout_seconds=wake_window_timeout_seconds,
+        inactivity_auto_pause_seconds=inactivity_auto_pause_seconds,
+        chunk_duration_seconds=chunk_duration_seconds,
+        transcribe_batch_frames=transcribe_batch_frames,
+        transcribe_idle_flush_seconds=0.5,
         toggle_hotkey=toggle_hotkey,
         asr_engine_factory=asr_engine_factory,
     )
@@ -458,6 +477,9 @@ def start_command(
     keyboard_backend: KeyboardBackend | None = None
     if LinuxKeyboardBackend is not None:
         try:
+            char_delay_ms = int(getattr(getattr(config, "typing", None), "char_delay_ms", 8))
+            keyboard_backend = LinuxKeyboardBackend(char_delay_ms=char_delay_ms)
+        except TypeError:
             keyboard_backend = LinuxKeyboardBackend()
         except Exception as e:
             click.echo(f"Warning: Could not initialize keyboard backend: {e}", err=True)
@@ -690,13 +712,14 @@ def status_command(ctx: click.Context) -> None:
     runtime_state = "stopped"
     try:
         guard = SingleInstanceGuard()
-        guard.acquire()
-        # If we can acquire the lock, no runtime is running
-        guard.release()
-    except RuntimeError:
-        # Lock is held by another process - runtime is running
-        runtime_running = True
-        runtime_state = "running"
+        if guard.try_acquire():
+            guard.release()
+        else:
+            runtime_running = True
+            runtime_state = "running"
+    except OSError:
+        runtime_running = False
+        runtime_state = "unknown"
 
     # Get config summary
     config_summary: dict[str, Any] = {}

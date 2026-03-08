@@ -72,6 +72,49 @@ def test_json_output_shape_is_deterministic() -> None:
     assert "models" in payload["result"]
 
 
+def test_status_reports_running_when_instance_lock_is_held(monkeypatch) -> None:
+    runner = CliRunner()
+
+    class GuardLockHeld:
+        def try_acquire(self) -> bool:
+            return False
+
+        def release(self) -> None:
+            return
+
+    monkeypatch.setattr("voicekey.app.single_instance.SingleInstanceGuard", GuardLockHeld)
+
+    result = runner.invoke(cli, ["--output", "json", "status"])
+
+    assert result.exit_code == ExitCode.SUCCESS
+    payload = json.loads(result.output)
+    assert payload["result"]["runtime"]["running"] is True
+    assert payload["result"]["runtime"]["state"] == "running"
+
+
+def test_status_reports_stopped_when_instance_lock_is_available(monkeypatch) -> None:
+    runner = CliRunner()
+
+    class GuardLockAvailable:
+        def __init__(self) -> None:
+            self.released = False
+
+        def try_acquire(self) -> bool:
+            return True
+
+        def release(self) -> None:
+            self.released = True
+
+    monkeypatch.setattr("voicekey.app.single_instance.SingleInstanceGuard", GuardLockAvailable)
+
+    result = runner.invoke(cli, ["--output", "json", "status"])
+
+    assert result.exit_code == ExitCode.SUCCESS
+    payload = json.loads(result.output)
+    assert payload["result"]["runtime"]["running"] is False
+    assert payload["result"]["runtime"]["state"] == "stopped"
+
+
 def test_unknown_command_returns_deterministic_usage_error_exit_code() -> None:
     runner = CliRunner()
 
