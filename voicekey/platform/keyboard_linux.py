@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 from typing import Protocol
 
 from voicekey.platform.compatibility import detect_display_session
@@ -41,6 +43,76 @@ class _NoOpInjector:
         del keys
 
 
+class _PynputInjector:
+    """Concrete injector backed by pynput keyboard controller."""
+
+    _ALIASES: dict[str, str] = {
+        "control": "ctrl",
+        "return": "enter",
+        "esc": "esc",
+        "super": "cmd",
+        "meta": "cmd",
+        "win": "cmd",
+        "pageup": "page_up",
+        "pagedown": "page_down",
+        "pgup": "page_up",
+        "pgdn": "page_down",
+    }
+
+    def __init__(self, *, controller: Any, key_namespace: Any) -> None:
+        self._controller = controller
+        self._key_namespace = key_namespace
+
+    def type_text(self, text: str, delay_ms: int) -> None:
+        if delay_ms <= 0:
+            self._controller.type(text)
+            return
+
+        delay_s = delay_ms / 1000
+        for char in text:
+            self._controller.type(char)
+            time.sleep(delay_s)
+
+    def press_key(self, key: str) -> None:
+        resolved = self._resolve_key(key)
+        self._controller.press(resolved)
+        self._controller.release(resolved)
+
+    def press_combo(self, keys: list[str]) -> None:
+        resolved = [self._resolve_key(key) for key in keys]
+        for key in resolved:
+            self._controller.press(key)
+        for key in reversed(resolved):
+            self._controller.release(key)
+
+    def _resolve_key(self, key: str) -> Any:
+        normalized = key.strip().lower()
+        if not normalized:
+            return key
+
+        mapped = self._ALIASES.get(normalized, normalized)
+        key_value = getattr(self._key_namespace, mapped, None)
+        if key_value is not None:
+            return key_value
+        if len(mapped) == 1:
+            return mapped
+        return mapped
+
+
+def _create_pynput_injector() -> KeyboardInjector | None:
+    """Return pynput-backed injector when dependency/runtime are available."""
+
+    try:
+        from pynput.keyboard import Controller, Key
+    except Exception:
+        return None
+
+    try:
+        return _PynputInjector(controller=Controller(), key_namespace=Key)
+    except Exception:
+        return None
+
+
 class LinuxKeyboardBackend(KeyboardBackend):
     """Linux keyboard adapter with deterministic capability self-check."""
 
@@ -51,18 +123,32 @@ class LinuxKeyboardBackend(KeyboardBackend):
         self,
         *,
         session_type: str | None = None,
-        primary_available: bool = True,
+        primary_available: bool | None = None,
         fallback_available: bool = False,
         fallback_permitted: bool = False,
         primary_injector: KeyboardInjector | None = None,
         fallback_injector: KeyboardInjector | None = None,
     ) -> None:
         self._session_type = self._detect_session_type(session_type)
-        self._primary_available = primary_available
         self._fallback_available = fallback_available
         self._fallback_permitted = fallback_permitted
-        self._primary_injector = primary_injector or _NoOpInjector()
+
+        if primary_injector is not None:
+            self._primary_injector = primary_injector
+            self._primary_available = True if primary_available is None else primary_available
+        elif primary_available is None:
+            discovered = _create_pynput_injector()
+            self._primary_injector = discovered or _NoOpInjector()
+            self._primary_available = discovered is not None
+        elif primary_available:
+            self._primary_injector = _create_pynput_injector() or _NoOpInjector()
+            self._primary_available = True
+        else:
+            self._primary_injector = _NoOpInjector()
+            self._primary_available = False
+
         self._fallback_injector = fallback_injector or _NoOpInjector()
+        self._active_adapter = self._select_active_adapter()
 
     def type_text(self, text: str, delay_ms: int = 0) -> None:
         if not text:
@@ -100,7 +186,7 @@ class LinuxKeyboardBackend(KeyboardBackend):
             )
             remediation.append("Use an X11 session for full keyboard compatibility.")
 
-        active_adapter = self._select_active_adapter()
+        active_adapter = self._active_adapter
         if active_adapter is None:
             if not self._primary_available:
                 codes.append(KeyboardErrorCode.PRIMARY_BACKEND_UNAVAILABLE)
@@ -165,22 +251,29 @@ class LinuxKeyboardBackend(KeyboardBackend):
         return None
 
     def _resolve_injector(self) -> KeyboardInjector:
-        report = self.self_check()
-        if report.state is KeyboardCapabilityState.UNAVAILABLE:
-            code = report.codes[0] if report.codes else KeyboardErrorCode.PRIMARY_BACKEND_UNAVAILABLE
+        if self._active_adapter is None:
             raise KeyboardBackendError(
-                code,
+                self._unavailable_error_code(),
                 "Linux keyboard backend is unavailable. Run capability self-check for remediation.",
             )
 
-        if report.active_adapter == self._PRIMARY_ADAPTER:
+        if self._active_adapter == self._PRIMARY_ADAPTER:
             return self._primary_injector
-        if report.active_adapter == self._FALLBACK_ADAPTER:
+        if self._active_adapter == self._FALLBACK_ADAPTER:
             return self._fallback_injector
         raise KeyboardBackendError(
             KeyboardErrorCode.INJECTION_FAILED,
             "Linux keyboard backend has no active injector despite non-unavailable state.",
         )
+
+    def _unavailable_error_code(self) -> KeyboardErrorCode:
+        if not self._primary_available:
+            return KeyboardErrorCode.PRIMARY_BACKEND_UNAVAILABLE
+        if self._fallback_available and not self._fallback_permitted:
+            return KeyboardErrorCode.INPUT_PERMISSION_REQUIRED
+        if not self._fallback_available:
+            return KeyboardErrorCode.FALLBACK_BACKEND_UNAVAILABLE
+        return KeyboardErrorCode.PRIMARY_BACKEND_UNAVAILABLE
 
     @staticmethod
     def _invoke(action: Callable[[], None]) -> None:

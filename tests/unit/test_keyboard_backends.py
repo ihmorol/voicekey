@@ -155,3 +155,58 @@ def test_keyboard_backend_validates_invalid_inputs() -> None:
 
     assert empty_text_exc.value.code is KeyboardErrorCode.EMPTY_TEXT
     assert combo_exc.value.code is KeyboardErrorCode.INVALID_COMBO
+
+
+def test_linux_backend_uses_detected_primary_injector_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    injector = RecordingInjector()
+    monkeypatch.setattr(
+        "voicekey.platform.keyboard_linux._create_pynput_injector",
+        lambda: injector,
+    )
+    backend = LinuxKeyboardBackend(session_type="x11")
+
+    report = backend.self_check()
+    assert report.state is KeyboardCapabilityState.READY
+    assert report.active_adapter == "x11_pynput"
+
+    backend.press_key("enter")
+    assert injector.calls == ["key:enter"]
+
+
+def test_linux_backend_defaults_to_deterministic_unavailable_when_primary_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("voicekey.platform.keyboard_linux._create_pynput_injector", lambda: None)
+    backend = LinuxKeyboardBackend(session_type="x11")
+
+    first = backend.self_check()
+    second = backend.self_check()
+    assert first == second
+    assert first.state is KeyboardCapabilityState.UNAVAILABLE
+    assert first.active_adapter is None
+    assert KeyboardErrorCode.PRIMARY_BACKEND_UNAVAILABLE in first.codes
+
+    with pytest.raises(KeyboardBackendError) as exc_info:
+        backend.press_key("enter")
+    assert exc_info.value.code is KeyboardErrorCode.PRIMARY_BACKEND_UNAVAILABLE
+
+
+def test_linux_injector_resolution_avoids_self_check_hot_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    injector = RecordingInjector()
+    backend = LinuxKeyboardBackend(
+        session_type="x11",
+        primary_available=True,
+        primary_injector=injector,
+    )
+
+    def _fail_self_check() -> None:
+        raise AssertionError("self_check should not be called on the injection hot path")
+
+    monkeypatch.setattr(backend, "self_check", _fail_self_check)
+
+    backend.type_text("hello")
+    backend.press_key("enter")
+    backend.press_combo(["ctrl", "a"])
+    assert injector.calls == ["type:hello:0", "key:enter", "combo:ctrl+a"]
