@@ -67,6 +67,11 @@ class InactivityWatchdog:
         """Watchdog timeout configuration."""
         return self._config
 
+    @property
+    def is_armed(self) -> bool:
+        """Whether timeout polling is currently active."""
+        return self._mode is not None and self._last_activity_at is not None
+
     def arm_for_mode(self, mode: ListeningMode) -> None:
         """Arm the watchdog for an active listening session in the given mode."""
         self._mode = mode

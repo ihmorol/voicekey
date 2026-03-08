@@ -7,7 +7,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable
+from typing import Callable
 
 import numpy as np
 
@@ -20,6 +20,7 @@ from voicekey.app.state_machine import (
     TransitionResult,
     VoiceKeyStateMachine,
 )
+from voicekey.app.watchdog import InactivityWatchdog, WatchdogTimerConfig, WatchdogTimeoutType
 from voicekey.audio.asr_faster_whisper import TranscriptEvent
 from voicekey.audio.threshold import ConfidenceFilter
 from voicekey.audio.wake import WakePhraseDetector, WakeWindowController
@@ -95,10 +96,15 @@ class RuntimeCoordinator:
         device_index: int | None = None,
         sample_rate: int = 16000,
         vad_threshold: float = 0.5,
+        wake_window_timeout_seconds: float = 5.0,
+        inactivity_auto_pause_seconds: float = 30.0,
+        chunk_duration_seconds: float = 0.1,
+        transcribe_batch_frames: int = 5,
+        transcribe_idle_flush_seconds: float = 0.5,
     ) -> None:
         self._state_machine = state_machine
         self._wake_detector = wake_detector or WakePhraseDetector()
-        self._wake_window = wake_window or WakeWindowController()
+        self._wake_window = wake_window or WakeWindowController(timeout_seconds=wake_window_timeout_seconds)
         self._parser = parser or create_parser()
         self._routing_policy = routing_policy or RuntimeRoutingPolicy()
         self._action_router = action_router
@@ -121,18 +127,27 @@ class RuntimeCoordinator:
         self._device_index = device_index
         self._sample_rate = sample_rate
         self._vad_threshold = vad_threshold
+        self._chunk_duration_seconds = chunk_duration_seconds
+        self._transcribe_batch_frames = max(3, transcribe_batch_frames)
+        self._transcribe_idle_flush_seconds = max(0.0, transcribe_idle_flush_seconds)
 
         # Runtime state
         self._lock = threading.Lock()
         self._is_running = False
         self._processing_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
+        self._watchdog = InactivityWatchdog(
+            config=WatchdogTimerConfig(
+                wake_window_timeout_seconds=wake_window_timeout_seconds,
+                inactivity_auto_pause_seconds=inactivity_auto_pause_seconds,
+            )
+        )
 
         # Audio buffers for ASR
         self._audio_buffer: list = []
         self._buffer_lock = threading.Lock()
-        self._speech_active = False
-        self._min_speech_frames = 3  # Require 3 consecutive VAD detections
+        self._last_audio_frame_at: float | None = None
+        self._dropped_audio_frames = 0
 
         # Text output callback for runtime
         self._runtime_text_output: Callable[[str], None] | None = None
@@ -142,6 +157,11 @@ class RuntimeCoordinator:
         """Whether the runtime coordinator is currently running."""
         with self._lock:
             return self._is_running
+
+    @property
+    def dropped_audio_frames(self) -> int:
+        """Total dropped audio frames reported by audio capture."""
+        return self._dropped_audio_frames
 
     @property
     def toggle_hotkey(self) -> str:
@@ -172,6 +192,7 @@ class RuntimeCoordinator:
                     self._audio_capture = AudioCapture(
                         device_index=self._device_index,
                         sample_rate=self._sample_rate,
+                        chunk_duration=self._chunk_duration_seconds,
                     )
                 except Exception as e:
                     logger.error(f"Failed to initialize audio capture: {e}")
@@ -216,6 +237,8 @@ class RuntimeCoordinator:
             # Initialize keyboard backend and action router if not provided
             if self._action_router is None and self._keyboard_backend is not None:
                 self._action_router = ActionRouter(keyboard_backend=self._keyboard_backend)
+
+            self._install_audio_drop_callback()
 
             # Initialize hotkey backend
             if self._hotkey_backend is None and HotkeyBackend is not None:
@@ -273,6 +296,8 @@ class RuntimeCoordinator:
                 return
 
             logger.info("Stopping RuntimeCoordinator")
+            self._watchdog.disarm()
+            self._transcribe_and_route()
 
             # Signal stop event
             self._stop_event.set()
@@ -325,8 +350,7 @@ class RuntimeCoordinator:
             try:
                 wake_event = self._hotkey_wake_event()
                 self._state_machine.transition(wake_event)
-                if self._state_machine.mode is ListeningMode.WAKE_WORD:
-                    self._wake_window.open_window()
+                self._arm_listening_window()
             except Exception as e:
                 logger.warning(f"Failed to wake: {e}")
         elif current_state == AppState.LISTENING:
@@ -334,9 +358,9 @@ class RuntimeCoordinator:
             logger.info("Toggle hotkey pressed - going to sleep")
             self._is_manual_wake = False
             try:
+                self._transcribe_and_route()
                 self._state_machine.transition(AppEvent.WAKE_WINDOW_TIMEOUT)
-                if self._state_machine.mode is ListeningMode.WAKE_WORD:
-                    self._wake_window.close_window()
+                self._disarm_listening_window()
             except Exception as e:
                 logger.warning(f"Failed to sleep: {e}")
 
@@ -354,8 +378,6 @@ class RuntimeCoordinator:
 
     def _audio_processing_loop(self) -> None:
         """Main audio processing loop running in a separate thread."""
-        consecutive_speech_frames = 0
-
         while not self._stop_event.is_set():
             try:
                 # Get audio frame from queue with timeout
@@ -366,7 +388,7 @@ class RuntimeCoordinator:
                 try:
                     frame: AudioFrame = audio_queue.get(timeout=0.1)
                 except queue.Empty:
-                    # Check for timeout in listening state
+                    self._flush_if_idle()
                     if self._state_machine.state == AppState.LISTENING:
                         self._check_timeout()
                     continue
@@ -381,9 +403,7 @@ class RuntimeCoordinator:
 
     def _process_frame(self, frame: AudioFrame) -> None:
         """Process a single audio frame through the coordinator."""
-        # Check for timeout
-        if self._state_machine.state == AppState.LISTENING:
-            self._check_timeout()
+        self._check_timeout()
 
         # Get current state and handle accordingly
         state = self._state_machine.state
@@ -397,18 +417,22 @@ class RuntimeCoordinator:
             # Accumulate audio when in LISTENING mode
             with self._buffer_lock:
                 self._audio_buffer.append(frame.audio)
-            
-            # Check periodically (every ~1 second / 10 frames)
-            if len(self._audio_buffer) >= 10:
-                self._transcribe_and_type()
+                self._last_audio_frame_at = time.monotonic()
 
-    def _transcribe_and_type(self) -> None:
-        """Transcribe accumulated audio and type the result."""
+            if getattr(frame, "is_speech", None) is True:
+                self._watchdog.on_vad_activity()
+
+            if len(self._audio_buffer) >= self._transcribe_batch_frames:
+                self._transcribe_and_route()
+
+    def _transcribe_and_route(self) -> None:
+        """Transcribe accumulated audio and route transcript through the normal policy path."""
         with self._buffer_lock:
             if not self._audio_buffer:
                 return
             audio_data = np.concatenate(self._audio_buffer)
             self._audio_buffer.clear()
+            self._last_audio_frame_at = None
         
         if self._asr_engine is None:
             return
@@ -433,17 +457,15 @@ class RuntimeCoordinator:
                 events = asr_output
             
             for event in events:
-                if event.is_final:
-                    transcript = event.text.strip()
-                    if transcript:
-                        logger.info(f"Transcribed: '{transcript}'")
-                        # Type the text
-                        if self._keyboard_backend is not None:
-                            self._keyboard_backend.type_text(transcript + " ")
-                            logger.info(f"Typed: '{transcript}'")
-                        elif self._text_output is not None:
-                            self._text_output(transcript)
-                            
+                if not event.is_final:
+                    continue
+                update = self.on_transcript_event(event, vad_active=True)
+                if update.transition is not None:
+                    logger.info(
+                        "Transcript-driven transition: %s -> %s",
+                        update.transition.from_state,
+                        update.transition.to_state,
+                    )
         except Exception as e:
             logger.warning(f"Transcription failed: {e}")
 
@@ -451,7 +473,7 @@ class RuntimeCoordinator:
         """Check for wake window timeout."""
         update = self.poll()
         if update.transition is not None:
-            logger.info(f"Wake window timed out, transitioning to {update.transition.to_state}")
+            logger.info("Timeout transition applied: %s", update.transition.to_state)
 
     @property
     def state(self) -> AppState:
@@ -473,10 +495,9 @@ class RuntimeCoordinator:
         if self.state == AppState.PAUSED:
             return self._handle_paused_transcript(transcript)
 
-        if self._state_machine.mode is not ListeningMode.WAKE_WORD:
-            return RuntimeUpdate()
-
         if self.state == AppState.STANDBY:
+            if self._state_machine.mode is not ListeningMode.WAKE_WORD:
+                return RuntimeUpdate()
             if not vad_active:
                 return RuntimeUpdate()
             match = self._wake_detector.detect(transcript)
@@ -484,11 +505,15 @@ class RuntimeCoordinator:
                 return RuntimeUpdate()
 
             transition = self._state_machine.transition(AppEvent.WAKE_PHRASE_DETECTED)
-            self._wake_window.open_window()
+            self._arm_listening_window()
             return RuntimeUpdate(transition=transition, wake_detected=True)
 
-        if self.state == AppState.LISTENING and self._wake_window.is_open():
-            self._wake_window.on_activity()
+        if self.state == AppState.LISTENING:
+            if self._state_machine.mode is ListeningMode.WAKE_WORD and not self._wake_window.is_open():
+                return RuntimeUpdate()
+            if self._state_machine.mode is ListeningMode.WAKE_WORD and self._wake_window.is_open():
+                self._wake_window.on_activity()
+            self._watchdog.on_transcript_activity()
             return self._handle_listening_transcript(transcript)
 
         return RuntimeUpdate()
@@ -502,25 +527,27 @@ class RuntimeCoordinator:
 
     def on_activity(self) -> RuntimeUpdate:
         """Handle generic activity hooks (for example VAD/speech activity)."""
-        if self._state_machine.mode is not ListeningMode.WAKE_WORD:
-            return RuntimeUpdate()
-
         if self.state == AppState.LISTENING and self._wake_window.is_open():
             self._wake_window.on_activity()
+        if self.state == AppState.LISTENING:
+            self._watchdog.on_vad_activity()
 
         return RuntimeUpdate()
 
     def poll(self) -> RuntimeUpdate:
         """Advance timeout logic and emit FSM transition updates."""
-        if self._state_machine.mode is not ListeningMode.WAKE_WORD:
-            return RuntimeUpdate()
-
         if self.state is not AppState.LISTENING:
             return RuntimeUpdate()
-        if not self._wake_window.poll_timeout():
+        if not self._watchdog.is_armed:
+            self._watchdog.arm_for_mode(self._state_machine.mode)
+        timeout_event = self._watchdog.poll_timeout()
+        if timeout_event is None:
             return RuntimeUpdate()
-
-        transition = self._state_machine.transition(AppEvent.WAKE_WINDOW_TIMEOUT)
+        if timeout_event.timeout_type is WatchdogTimeoutType.WAKE_WINDOW_TIMEOUT:
+            self._wake_window.close_window()
+            transition = self._state_machine.transition(AppEvent.WAKE_WINDOW_TIMEOUT)
+            return RuntimeUpdate(transition=transition)
+        transition = self._state_machine.transition(AppEvent.INACTIVITY_AUTO_PAUSE)
         return RuntimeUpdate(transition=transition)
 
     def _handle_paused_transcript(self, transcript: str) -> RuntimeUpdate:
@@ -534,10 +561,12 @@ class RuntimeCoordinator:
 
         if parsed.command.command_id == "resume_voice_key":
             transition = self._state_machine.transition(AppEvent.RESUME_REQUESTED)
+            self._disarm_listening_window()
             return RuntimeUpdate(transition=transition)
 
         if parsed.command.command_id == "voice_key_stop":
             transition = self._state_machine.transition(AppEvent.STOP_REQUESTED)
+            self._disarm_listening_window()
             return RuntimeUpdate(transition=transition)
 
         return RuntimeUpdate()
@@ -552,8 +581,7 @@ class RuntimeCoordinator:
             literal = parsed.literal_text or ""
             if not literal:
                 return RuntimeUpdate()
-            if self._text_output is not None:
-                self._text_output(literal)
+            self._emit_text(literal)
             return RuntimeUpdate(routed_text=literal)
 
         if parsed.command is None:
@@ -562,10 +590,12 @@ class RuntimeCoordinator:
         command_id = parsed.command.command_id
         if command_id == "pause_voice_key":
             transition = self._state_machine.transition(AppEvent.INACTIVITY_AUTO_PAUSE)
+            self._disarm_listening_window()
             return RuntimeUpdate(transition=transition, executed_command_id=command_id)
 
         if command_id == "voice_key_stop":
             transition = self._state_machine.transition(AppEvent.STOP_REQUESTED)
+            self._disarm_listening_window()
             return RuntimeUpdate(transition=transition, executed_command_id=command_id)
 
         if self._action_router is None:
@@ -576,6 +606,49 @@ class RuntimeCoordinator:
             return RuntimeUpdate()
 
         return RuntimeUpdate(executed_command_id=command_id)
+
+    def _emit_text(self, literal: str) -> None:
+        if self._keyboard_backend is not None:
+            self._keyboard_backend.type_text(f"{literal} ")
+        if self._text_output is not None:
+            self._text_output(literal)
+        if self._runtime_text_output is not None:
+            self._runtime_text_output(literal)
+
+    def _arm_listening_window(self) -> None:
+        if self._state_machine.mode is ListeningMode.WAKE_WORD:
+            self._wake_window.open_window()
+        self._watchdog.arm_for_mode(self._state_machine.mode)
+
+    def _disarm_listening_window(self) -> None:
+        self._watchdog.disarm()
+        if self._state_machine.mode is ListeningMode.WAKE_WORD:
+            self._wake_window.close_window()
+
+    def _flush_if_idle(self) -> None:
+        if self._transcribe_idle_flush_seconds <= 0:
+            return
+        if self.state is not AppState.LISTENING:
+            return
+        with self._buffer_lock:
+            has_buffered_audio = bool(self._audio_buffer)
+            last_audio_frame_at = self._last_audio_frame_at
+        if not has_buffered_audio or last_audio_frame_at is None:
+            return
+        if (time.monotonic() - last_audio_frame_at) < self._transcribe_idle_flush_seconds:
+            return
+        self._transcribe_and_route()
+
+    def _install_audio_drop_callback(self) -> None:
+        if self._audio_capture is None:
+            return
+        setter = getattr(self._audio_capture, "set_drop_callback", None)
+        if callable(setter):
+            setter(self._on_audio_drop)
+
+    def _on_audio_drop(self, total_dropped_frames: int) -> None:
+        self._dropped_audio_frames = total_dropped_frames
+        logger.warning("Audio queue drop detected: total_dropped_frames=%d", total_dropped_frames)
 
 
 __all__ = ["RuntimeCoordinator", "RuntimeUpdate"]
