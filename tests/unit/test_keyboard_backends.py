@@ -161,7 +161,7 @@ def test_linux_backend_uses_detected_primary_injector_by_default(monkeypatch: py
     injector = RecordingInjector()
     monkeypatch.setattr(
         "voicekey.platform.keyboard_linux._create_pynput_injector",
-        lambda: injector,
+        lambda **_: injector,
     )
     backend = LinuxKeyboardBackend(session_type="x11")
 
@@ -176,7 +176,7 @@ def test_linux_backend_uses_detected_primary_injector_by_default(monkeypatch: py
 def test_linux_backend_defaults_to_deterministic_unavailable_when_primary_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("voicekey.platform.keyboard_linux._create_pynput_injector", lambda: None)
+    monkeypatch.setattr("voicekey.platform.keyboard_linux._create_pynput_injector", lambda **_: None)
     backend = LinuxKeyboardBackend(session_type="x11")
 
     first = backend.self_check()

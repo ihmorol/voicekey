@@ -6,8 +6,7 @@ import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
-from typing import Protocol
+from typing import Any, Protocol
 
 from voicekey.platform.compatibility import detect_display_session
 from voicekey.platform.keyboard_base import (
@@ -59,16 +58,24 @@ class _PynputInjector:
         "pgdn": "page_down",
     }
 
-    def __init__(self, *, controller: Any, key_namespace: Any) -> None:
+    def __init__(
+        self,
+        *,
+        controller: Any,
+        key_namespace: Any,
+        default_delay_ms: int = 0,
+    ) -> None:
         self._controller = controller
         self._key_namespace = key_namespace
+        self._default_delay_ms = max(0, default_delay_ms)
 
     def type_text(self, text: str, delay_ms: int) -> None:
-        if delay_ms <= 0:
+        effective_delay_ms = delay_ms if delay_ms > 0 else self._default_delay_ms
+        if effective_delay_ms <= 0:
             self._controller.type(text)
             return
 
-        delay_s = delay_ms / 1000
+        delay_s = effective_delay_ms / 1000
         for char in text:
             self._controller.type(char)
             time.sleep(delay_s)
@@ -99,7 +106,7 @@ class _PynputInjector:
         return mapped
 
 
-def _create_pynput_injector() -> KeyboardInjector | None:
+def _create_pynput_injector(*, default_delay_ms: int = 0) -> KeyboardInjector | None:
     """Return pynput-backed injector when dependency/runtime are available."""
 
     try:
@@ -108,7 +115,11 @@ def _create_pynput_injector() -> KeyboardInjector | None:
         return None
 
     try:
-        return _PynputInjector(controller=Controller(), key_namespace=Key)
+        return _PynputInjector(
+            controller=Controller(),
+            key_namespace=Key,
+            default_delay_ms=default_delay_ms,
+        )
     except Exception:
         return None
 
@@ -128,20 +139,24 @@ class LinuxKeyboardBackend(KeyboardBackend):
         fallback_permitted: bool = False,
         primary_injector: KeyboardInjector | None = None,
         fallback_injector: KeyboardInjector | None = None,
+        char_delay_ms: int = 8,
     ) -> None:
         self._session_type = self._detect_session_type(session_type)
         self._fallback_available = fallback_available
         self._fallback_permitted = fallback_permitted
+        self._char_delay_ms = max(0, char_delay_ms)
 
         if primary_injector is not None:
             self._primary_injector = primary_injector
             self._primary_available = True if primary_available is None else primary_available
         elif primary_available is None:
-            discovered = _create_pynput_injector()
+            discovered = _create_pynput_injector(default_delay_ms=self._char_delay_ms)
             self._primary_injector = discovered or _NoOpInjector()
             self._primary_available = discovered is not None
         elif primary_available:
-            self._primary_injector = _create_pynput_injector() or _NoOpInjector()
+            self._primary_injector = (
+                _create_pynput_injector(default_delay_ms=self._char_delay_ms) or _NoOpInjector()
+            )
             self._primary_available = True
         else:
             self._primary_injector = _NoOpInjector()
